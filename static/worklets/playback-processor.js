@@ -1,3 +1,5 @@
+const PLAYBACK_QUEUE_MAX_FRAMES = 24;
+
 class PlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -6,17 +8,27 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.currentOffset = 0;
 
     this.port.onmessage = (event) => {
-      const buffer = event.data;
-      if (!(buffer instanceof ArrayBuffer)) {
+      const payload = event.data;
+      let frame = null;
+
+      if (payload instanceof Float32Array) {
+        frame = payload;
+      } else if (payload instanceof ArrayBuffer) {
+        const input = new Int16Array(payload);
+        frame = new Float32Array(input.length);
+        for (let i = 0; i < input.length; i += 1) {
+          frame[i] = input[i] / 32768;
+        }
+      }
+
+      if (!frame || frame.length === 0) {
         return;
       }
 
-      const input = new Int16Array(buffer);
-      const frame = new Float32Array(input.length);
-      for (let i = 0; i < input.length; i += 1) {
-        frame[i] = input[i] / 32768;
-      }
       this.queue.push(frame);
+      if (this.queue.length > PLAYBACK_QUEUE_MAX_FRAMES) {
+        this.queue.splice(0, this.queue.length - PLAYBACK_QUEUE_MAX_FRAMES);
+      }
     };
   }
 

@@ -12,6 +12,7 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use nnnoiseless::DenoiseState;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info};
@@ -20,6 +21,12 @@ use uuid::Uuid;
 const SAMPLE_RATE: usize = 48_000;
 const FRAME_SIZE: usize = 480;
 const FRAME_BYTES: usize = FRAME_SIZE * 2;
+const CLIENT_SEND_QUEUE_CAPACITY: usize = 32;
+const AUDIO_PACKET_MAGIC: u8 = 0x43;
+const AUDIO_PACKET_VERSION: u8 = 1;
+const AUDIO_PACKET_HEADER_BYTES: usize = 4;
+const AUDIO_CODEC_PCM16: u8 = 0;
+const AUDIO_CODEC_OPUS: u8 = 1;
 
 #[derive(Clone)]
 struct AppState {
@@ -41,7 +48,7 @@ struct Room {
 #[derive(Clone)]
 struct ClientConnection {
     display_name: String,
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::Sender<Message>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,10 +80,17 @@ struct RoomUsersResponse {
     users: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RoomPeerInfo {
+    id: String,
+    name: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientWsEvent {
     Ping { seq: u64, ts: u64 },
+    RtcSignal { to: Option<String>, data: Value },
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +98,22 @@ enum ClientWsEvent {
 enum ServerWsEvent {
     Pong { seq: u64, ts: u64 },
     RoomUsers { room: String, users: Vec<String> },
+    Welcome { client_id: String },
+    RoomPeers { room: String, peers: Vec<RoomPeerInfo> },
+    RtcSignal { from: String, to: Option<String>, data: Value },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioCodec {
+    Pcm16,
+    Opus,
+}
+
+#[derive(Debug)]
+struct AudioFrame {
+    codec: AudioCodec,
+    payload: Vec<u8>,
+    legacy_raw_pcm: bool,
 }
 
 #[tokio::main]
@@ -100,8 +130,8 @@ async fn main() {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/rooms", get(rooms_handler))
-        .route("/api/rooms/{room}/users", get(room_users_handler))
-        .nest_service("/", ServeDir::new("static").append_index_html_on_directories(true))
+        .route("/api/rooms/:room/users", get(room_users_handler))
+        .fallback_service(ServeDir::new("static").append_index_html_on_directories(true))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -118,7 +148,7 @@ async fn main() {
             std::process::exit(1);
         });
         info!(
-            "server started at http://{}, expected audio format: {} Hz mono, {} samples/frame",
+            "server started at http://{}, expected PCM input: {} Hz mono, {} samples/frame (Opus packet relay enabled)",
             addr, SAMPLE_RATE, FRAME_SIZE
         );
         listeners.push((addr, listener));
@@ -249,7 +279,7 @@ async fn ws_handler(
 async fn handle_socket(state: AppState, socket: WebSocket, room: String, name: String) {
     let client_id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(CLIENT_SEND_QUEUE_CAPACITY);
 
     let write_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -270,7 +300,14 @@ async fn handle_socket(state: AppState, socket: WebSocket, room: String, name: S
         )
         .await;
 
+    send_ws_event(
+        &out_tx,
+        &ServerWsEvent::Welcome {
+            client_id: client_id.to_string(),
+        },
+    );
     state.broadcast_room_users(&room).await;
+    state.broadcast_room_peers(&room).await;
 
     info!("client connected: room={room}, name={name}, id={client_id}");
     let mut denoise_state = DenoiseState::new();
@@ -287,15 +324,30 @@ async fn handle_socket(state: AppState, socket: WebSocket, room: String, name: S
 
         match msg {
             Message::Binary(bin) => {
-                if bin.len() != FRAME_BYTES {
+                let Some(frame) = decode_audio_frame(bin.as_ref()) else {
                     continue;
+                };
+
+                match frame.codec {
+                    AudioCodec::Pcm16 => {
+                        let cleaned = denoise_bytes(&mut denoise_state, &frame.payload);
+                        if drop_first_output {
+                            drop_first_output = false;
+                            continue;
+                        }
+
+                        if frame.legacy_raw_pcm {
+                            state.broadcast_audio(&room, client_id, cleaned).await;
+                        } else {
+                            let encoded = encode_audio_packet(AudioCodec::Pcm16, &cleaned);
+                            state.broadcast_audio(&room, client_id, encoded).await;
+                        }
+                    }
+                    AudioCodec::Opus => {
+                        let encoded = encode_audio_packet(AudioCodec::Opus, &frame.payload);
+                        state.broadcast_audio(&room, client_id, encoded).await;
+                    }
                 }
-                let cleaned = denoise_bytes(&mut denoise_state, &bin);
-                if drop_first_output {
-                    drop_first_output = false;
-                    continue;
-                }
-                state.broadcast_audio(&room, client_id, cleaned).await;
             }
             Message::Text(text) => {
                 if let Ok(event) = serde_json::from_str::<ClientWsEvent>(text.as_ref()) {
@@ -303,11 +355,14 @@ async fn handle_socket(state: AppState, socket: WebSocket, room: String, name: S
                         ClientWsEvent::Ping { seq, ts } => {
                             send_ws_event(&out_tx, &ServerWsEvent::Pong { seq, ts });
                         }
+                        ClientWsEvent::RtcSignal { to, data } => {
+                            state.broadcast_rtc_signal(&room, client_id, to, data).await;
+                        }
                     }
                 }
             }
             Message::Ping(payload) => {
-                let _ = out_tx.send(Message::Pong(payload));
+                let _ = out_tx.try_send(Message::Pong(payload));
             }
             Message::Close(_) => break,
             Message::Pong(_) => {}
@@ -316,6 +371,7 @@ async fn handle_socket(state: AppState, socket: WebSocket, room: String, name: S
 
     state.remove_client(&room, client_id).await;
     state.broadcast_room_users(&room).await;
+    state.broadcast_room_peers(&room).await;
     write_task.abort();
     info!("client disconnected: room={room}, id={client_id}");
 }
@@ -356,8 +412,12 @@ impl AppState {
         };
 
         for (name, tx) in recipients {
-            if tx.send(Message::Binary(payload.clone().into())).is_err() {
-                error!("failed to push audio frame to client {name} in room {room}");
+            match tx.try_send(Message::Binary(payload.clone().into())) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    error!("failed to push audio frame to closed client {name} in room {room}");
+                }
             }
         }
     }
@@ -389,6 +449,25 @@ impl AppState {
             .unwrap_or_default();
         users.sort();
         users
+    }
+
+    async fn room_peers_snapshot(&self, room: &str) -> Vec<RoomPeerInfo> {
+        let rooms = self.rooms.read().await;
+        let mut peers = rooms
+            .get(room)
+            .map(|room_state| {
+                room_state
+                    .clients
+                    .iter()
+                    .map(|(id, client)| RoomPeerInfo {
+                        id: id.to_string(),
+                        name: client.display_name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
+        peers
     }
 
     async fn broadcast_room_users(&self, room: &str) {
@@ -423,17 +502,132 @@ impl AppState {
             send_ws_event(&tx, &event);
         }
     }
+
+    async fn broadcast_room_peers(&self, room: &str) {
+        let peers = self.room_peers_snapshot(room).await;
+        let recipients = {
+            let rooms = self.rooms.read().await;
+            let Some(room_state) = rooms.get(room) else {
+                return;
+            };
+            room_state
+                .clients
+                .values()
+                .map(|client| client.tx.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let event = ServerWsEvent::RoomPeers {
+            room: room.to_string(),
+            peers,
+        };
+
+        for tx in recipients {
+            send_ws_event(&tx, &event);
+        }
+    }
+
+    async fn broadcast_rtc_signal(
+        &self,
+        room: &str,
+        sender: Uuid,
+        to: Option<String>,
+        data: Value,
+    ) {
+        let target = to
+            .as_deref()
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        let recipients = {
+            let rooms = self.rooms.read().await;
+            rooms
+                .get(room)
+                .map(|room_state| {
+                    room_state
+                        .clients
+                        .iter()
+                        .filter(|(client_id, _)| **client_id != sender)
+                        .filter(|(client_id, _)| target.is_none_or(|t| **client_id == t))
+                        .map(|(_, client)| client.tx.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        let event = ServerWsEvent::RtcSignal {
+            from: sender.to_string(),
+            to,
+            data,
+        };
+
+        for tx in recipients {
+            send_ws_event(&tx, &event);
+        }
+    }
 }
 
-fn send_ws_event(tx: &mpsc::UnboundedSender<Message>, event: &ServerWsEvent) {
+fn send_ws_event(tx: &mpsc::Sender<Message>, event: &ServerWsEvent) {
     match serde_json::to_string(event) {
         Ok(payload) => {
-            let _ = tx.send(Message::Text(payload.into()));
+            let _ = tx.try_send(Message::Text(payload.into()));
         }
         Err(err) => {
             error!("failed to serialize ws event: {err}");
         }
     }
+}
+
+fn decode_audio_frame(bin: &[u8]) -> Option<AudioFrame> {
+    if bin.len() == FRAME_BYTES {
+        return Some(AudioFrame {
+            codec: AudioCodec::Pcm16,
+            payload: bin.to_vec(),
+            legacy_raw_pcm: true,
+        });
+    }
+
+    if bin.len() < AUDIO_PACKET_HEADER_BYTES {
+        return None;
+    }
+
+    if bin[0] != AUDIO_PACKET_MAGIC || bin[1] != AUDIO_PACKET_VERSION {
+        return None;
+    }
+
+    let codec = match bin[2] {
+        AUDIO_CODEC_PCM16 => AudioCodec::Pcm16,
+        AUDIO_CODEC_OPUS => AudioCodec::Opus,
+        _ => return None,
+    };
+
+    let payload = bin[AUDIO_PACKET_HEADER_BYTES..].to_vec();
+    if payload.is_empty() {
+        return None;
+    }
+
+    if codec == AudioCodec::Pcm16 && payload.len() != FRAME_BYTES {
+        return None;
+    }
+
+    Some(AudioFrame {
+        codec,
+        payload,
+        legacy_raw_pcm: false,
+    })
+}
+
+fn encode_audio_packet(codec: AudioCodec, payload: &[u8]) -> Vec<u8> {
+    let codec_id = match codec {
+        AudioCodec::Pcm16 => AUDIO_CODEC_PCM16,
+        AudioCodec::Opus => AUDIO_CODEC_OPUS,
+    };
+
+    let mut out = Vec::with_capacity(AUDIO_PACKET_HEADER_BYTES + payload.len());
+    out.push(AUDIO_PACKET_MAGIC);
+    out.push(AUDIO_PACKET_VERSION);
+    out.push(codec_id);
+    out.push(0);
+    out.extend_from_slice(payload);
+    out
 }
 
 fn denoise_bytes(state: &mut DenoiseState, input_bytes: &[u8]) -> Vec<u8> {

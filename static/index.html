@@ -81,7 +81,8 @@
       margin-bottom: 6px;
     }
 
-    input {
+    input,
+    select {
       width: 100%;
       border-radius: 10px;
       border: 1px solid #2b4f57;
@@ -242,6 +243,34 @@
             <label for="volume">播放音量（0-100）</label>
             <input id="volume" type="number" min="0" max="100" step="1" value="100" />
           </div>
+          <div>
+            <label for="channelMode">Opus 声道</label>
+            <select id="channelMode">
+              <option value="mono" selected>单声道</option>
+              <option value="stereo">立体声</option>
+            </select>
+          </div>
+          <div>
+            <label for="aecMode">AEC 回声消除</label>
+            <select id="aecMode">
+              <option value="on" selected>开启</option>
+              <option value="off">关闭</option>
+            </select>
+          </div>
+          <div>
+            <label for="nsMode">NS 噪声抑制</label>
+            <select id="nsMode">
+              <option value="on" selected>开启</option>
+              <option value="off">关闭</option>
+            </select>
+          </div>
+          <div>
+            <label for="agcMode">AGC 自动增益</label>
+            <select id="agcMode">
+              <option value="on" selected>开启</option>
+              <option value="off">关闭</option>
+            </select>
+          </div>
         </div>
 
         <div class="actions">
@@ -283,6 +312,14 @@
             <div class="metric">
               <div class="k">探测包收到</div>
               <div class="v" id="recvValue">0</div>
+            </div>
+            <div class="metric">
+              <div class="k">上行码率</div>
+              <div class="v" id="txRateValue">-</div>
+            </div>
+            <div class="metric">
+              <div class="k">下行码率</div>
+              <div class="v" id="rxRateValue">-</div>
             </div>
           </div>
         </section>
