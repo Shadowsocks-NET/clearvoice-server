@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rust 语音 IM（服务端降噪）</title>
+  <style>
+    :root {
+      --bg: #0b1215;
+      --panel: #132229;
+      --accent: #5ad4a7;
+      --text: #d7e5e0;
+      --muted: #8aa39a;
+      --danger: #f26f6f;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at 30% 15%, #1b323a, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .card {
+      width: min(680px, 100%);
+      background: color-mix(in oklab, var(--panel) 90%, #000);
+      border: 1px solid #234149;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 15px 40px rgba(0, 0, 0, 0.35);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+    }
+
+    .desc {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    input {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid #2b4f57;
+      background: #0a161a;
+      color: var(--text);
+      padding: 10px 12px;
+      outline: none;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      margin: 14px 0;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      background: var(--accent);
+      color: #052318;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: #315e66;
+      color: #d5eaec;
+    }
+
+    button.danger {
+      background: var(--danger);
+      color: #2f0505;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .status {
+      font-size: 13px;
+      margin-bottom: 8px;
+      color: var(--muted);
+    }
+
+    #log {
+      margin: 0;
+      border-radius: 10px;
+      border: 1px solid #244951;
+      background: #081114;
+      padding: 12px;
+      min-height: 140px;
+      max-height: 260px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      color: #b6cbc4;
+    }
+
+    @media (max-width: 640px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <section class="card">
+    <h1>语音 IM（服务端统一降噪）</h1>
+    <p class="desc">所有音频帧先发到 Rust 服务端，使用 nnnoiseless 降噪后再转发给同房间其他成员。</p>
+
+    <div class="grid">
+      <div>
+        <label for="serverUrl">WebSocket 地址</label>
+        <input id="serverUrl" />
+      </div>
+      <div>
+        <label for="room">房间</label>
+        <input id="room" value="main" />
+      </div>
+      <div>
+        <label for="name">昵称</label>
+        <input id="name" value="guest" />
+      </div>
+      <div>
+        <label for="volume">播放音量（0-1）</label>
+        <input id="volume" type="number" min="0" max="1" step="0.1" value="1" />
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="connectBtn">连接并开始语音</button>
+      <button id="disconnectBtn" class="danger" disabled>断开</button>
+      <button id="muteBtn" class="secondary" disabled>静音上行</button>
+    </div>
+
+    <div class="status" id="status">状态：未连接</div>
+    <pre id="log"></pre>
+  </section>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
