@@ -1,4 +1,8 @@
 const FRAME_SIZE = 480;
+const PING_INTERVAL_MS = 3000;
+const PING_TIMEOUT_MS = 8000;
+const PING_HISTORY_MAX = 40;
+const PRESENCE_REFRESH_MS = 2500;
 
 const serverUrlInput = document.getElementById("serverUrl");
 const roomInput = document.getElementById("room");
@@ -9,6 +13,13 @@ const disconnectBtn = document.getElementById("disconnectBtn");
 const muteBtn = document.getElementById("muteBtn");
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
+
+const roomsListEl = document.getElementById("roomsList");
+const usersListEl = document.getElementById("usersList");
+const pingValueEl = document.getElementById("pingValue");
+const lossValueEl = document.getElementById("lossValue");
+const sentValueEl = document.getElementById("sentValue");
+const recvValueEl = document.getElementById("recvValue");
 
 serverUrlInput.value = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 
@@ -28,6 +39,17 @@ let fallbackPlaybackQueue = [];
 let fallbackPlaybackFrame = null;
 let fallbackPlaybackOffset = 0;
 
+let pingTimer = null;
+let pingSeq = 0;
+let pingSent = 0;
+let pingRecv = 0;
+let pingLastRtt = null;
+const pingPending = new Map();
+const pingHistory = [];
+
+let presenceTimer = null;
+let lastPresenceErrorAt = 0;
+
 function log(message) {
   const now = new Date().toLocaleTimeString();
   logEl.textContent += `[${now}] ${message}\n`;
@@ -44,11 +66,256 @@ function setConnectedUi(connected) {
   muteBtn.disabled = !connected;
 }
 
+function sanitizeToken(raw, fallback) {
+  const cleaned = (raw ?? "")
+    .toString()
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(0, 32);
+  return cleaned || fallback;
+}
+
+function currentRoom() {
+  return sanitizeToken(roomInput.value, "main");
+}
+
+function currentName() {
+  return sanitizeToken(nameInput.value, "anonymous");
+}
+
+function currentVolumePercent() {
+  return Math.max(0, Math.min(100, Number(volumeInput.value) || 100));
+}
+
 function buildWsUrl() {
   const base = serverUrlInput.value.trim();
-  const room = encodeURIComponent(roomInput.value.trim() || "main");
-  const name = encodeURIComponent(nameInput.value.trim() || "anonymous");
+  const room = encodeURIComponent(currentRoom());
+  const name = encodeURIComponent(currentName());
   return `${base}?room=${room}&name=${name}`;
+}
+
+function apiOriginFromWsUrl() {
+  let url;
+  try {
+    url = new URL(serverUrlInput.value.trim(), location.href);
+  } catch {
+    url = new URL(location.href);
+  }
+
+  if (url.protocol === "wss:") {
+    url.protocol = "https:";
+  } else if (url.protocol === "ws:") {
+    url.protocol = "http:";
+  }
+
+  return url.origin;
+}
+
+function renderList(listEl, items, renderItem) {
+  listEl.innerHTML = "";
+  if (!items || items.length === 0) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "暂无数据";
+    listEl.appendChild(li);
+    return;
+  }
+
+  for (const item of items) {
+    listEl.appendChild(renderItem(item));
+  }
+}
+
+function renderRooms(rooms) {
+  const sorted = [...rooms].sort((a, b) => a.name.localeCompare(b.name));
+  renderList(roomsListEl, sorted, (room) => {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.textContent = room.name;
+    const count = document.createElement("span");
+    count.textContent = `${room.online}`;
+    li.appendChild(name);
+    li.appendChild(count);
+    return li;
+  });
+}
+
+function renderUsers(users) {
+  const sorted = [...users].sort((a, b) => a.localeCompare(b));
+  renderList(usersListEl, sorted, (user) => {
+    const li = document.createElement("li");
+    li.textContent = user;
+    return li;
+  });
+}
+
+function resetPingStats() {
+  pingSeq = 0;
+  pingSent = 0;
+  pingRecv = 0;
+  pingLastRtt = null;
+  pingPending.clear();
+  pingHistory.length = 0;
+  updatePingStatsUi();
+}
+
+function updatePingStatsUi() {
+  pingValueEl.textContent = pingLastRtt == null ? "-" : `${pingLastRtt} ms`;
+  sentValueEl.textContent = String(pingSent);
+  recvValueEl.textContent = String(pingRecv);
+
+  let considered = 0;
+  let lost = 0;
+  for (const item of pingHistory) {
+    if (item.status === "acked" || item.status === "lost") {
+      considered += 1;
+    }
+    if (item.status === "lost") {
+      lost += 1;
+    }
+  }
+
+  const loss = considered === 0 ? 0 : (lost / considered) * 100;
+  lossValueEl.textContent = `${loss.toFixed(1)}%`;
+}
+
+function markPingStatus(seq, status) {
+  for (let i = pingHistory.length - 1; i >= 0; i -= 1) {
+    if (pingHistory[i].seq === seq) {
+      pingHistory[i].status = status;
+      return;
+    }
+  }
+}
+
+function trimPingHistory() {
+  if (pingHistory.length <= PING_HISTORY_MAX) {
+    return;
+  }
+  pingHistory.splice(0, pingHistory.length - PING_HISTORY_MAX);
+}
+
+function sweepPingTimeouts() {
+  const now = Date.now();
+  for (const [seq, sentAt] of pingPending.entries()) {
+    if (now - sentAt > PING_TIMEOUT_MS) {
+      pingPending.delete(seq);
+      markPingStatus(seq, "lost");
+    }
+  }
+}
+
+function sendPingProbe() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  sweepPingTimeouts();
+
+  const seq = ++pingSeq;
+  const now = Date.now();
+  pingSent += 1;
+  pingPending.set(seq, now);
+  pingHistory.push({ seq, status: "pending" });
+  trimPingHistory();
+
+  ws.send(JSON.stringify({ type: "ping", seq, ts: now }));
+  updatePingStatsUi();
+}
+
+function onPongMessage(seq) {
+  const sentAt = pingPending.get(seq);
+  if (sentAt == null) {
+    return;
+  }
+
+  pingPending.delete(seq);
+  pingRecv += 1;
+  pingLastRtt = Math.max(0, Date.now() - sentAt);
+  markPingStatus(seq, "acked");
+  updatePingStatsUi();
+}
+
+function startPingLoop() {
+  stopPingLoop();
+  sendPingProbe();
+  pingTimer = setInterval(() => {
+    sendPingProbe();
+  }, PING_INTERVAL_MS);
+}
+
+function stopPingLoop() {
+  if (pingTimer) {
+    clearInterval(pingTimer);
+    pingTimer = null;
+  }
+}
+
+function handleSignalText(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  if (data.type === "pong" && Number.isInteger(data.seq)) {
+    onPongMessage(data.seq);
+    return;
+  }
+
+  if (data.type === "room_users" && typeof data.room === "string" && Array.isArray(data.users)) {
+    if (data.room === currentRoom()) {
+      renderUsers(data.users.filter((item) => typeof item === "string"));
+    }
+  }
+}
+
+async function fetchJson(url, timeoutMs = 1800) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function refreshPresence() {
+  const origin = apiOriginFromWsUrl();
+  const room = currentRoom();
+
+  try {
+    const [roomsData, usersData] = await Promise.all([
+      fetchJson(`${origin}/api/rooms`),
+      fetchJson(`${origin}/api/rooms/${encodeURIComponent(room)}/users`),
+    ]);
+
+    renderRooms(Array.isArray(roomsData.rooms) ? roomsData.rooms : []);
+    renderUsers(Array.isArray(usersData.users) ? usersData.users : []);
+  } catch (err) {
+    const now = Date.now();
+    if (now - lastPresenceErrorAt > 15000) {
+      log(`拉取在线信息失败: ${err.message}`);
+      lastPresenceErrorAt = now;
+    }
+  }
+}
+
+function startPresenceLoop() {
+  if (presenceTimer) {
+    clearInterval(presenceTimer);
+  }
+  refreshPresence().catch(() => {});
+  presenceTimer = setInterval(() => {
+    refreshPresence().catch(() => {});
+  }, PRESENCE_REFRESH_MS);
 }
 
 async function ensureAudio() {
@@ -68,16 +335,16 @@ async function ensureAudio() {
       sampleRate: 48000,
       echoCancellation: false,
       noiseSuppression: false,
-      autoGainControl: false
+      autoGainControl: false,
     },
-    video: false
+    video: false,
   });
 
   const micSource = audioContext.createMediaStreamSource(stream);
   usingWorklet = Boolean(audioContext.audioWorklet && typeof AudioWorkletNode !== "undefined");
 
   playbackGain = audioContext.createGain();
-  playbackGain.gain.value = Number(volumeInput.value) || 1;
+  playbackGain.gain.value = currentVolumePercent() / 100;
 
   if (usingWorklet) {
     await audioContext.audioWorklet.addModule("/worklets/capture-processor.js");
@@ -86,14 +353,14 @@ async function ensureAudio() {
     captureNode = new AudioWorkletNode(audioContext, "capture-processor", {
       numberOfInputs: 1,
       numberOfOutputs: 0,
-      channelCount: 1
+      channelCount: 1,
     });
     micSource.connect(captureNode);
 
     playbackNode = new AudioWorkletNode(audioContext, "playback-processor", {
       numberOfInputs: 0,
       numberOfOutputs: 1,
-      outputChannelCount: [1]
+      outputChannelCount: [1],
     });
     playbackNode.connect(playbackGain).connect(audioContext.destination);
 
@@ -114,7 +381,6 @@ async function ensureAudio() {
     captureNode = audioContext.createScriptProcessor(1024, 1, 1);
     micSource.connect(captureNode);
 
-    // 兼容模式下必须接到输出链路，处理回调才会持续触发。
     fallbackCaptureSink = audioContext.createGain();
     fallbackCaptureSink.gain.value = 0;
     captureNode.connect(fallbackCaptureSink);
@@ -190,14 +456,18 @@ function bindWsEvents() {
   ws.onopen = () => {
     setStatus("已连接，语音中");
     setConnectedUi(true);
+    startPingLoop();
+    refreshPresence().catch(() => {});
     log("WebSocket 已连接");
   };
 
   ws.onclose = () => {
     setStatus("已断开");
     setConnectedUi(false);
+    stopPingLoop();
     log("WebSocket 已断开");
     teardownAudio().catch((err) => log(`释放音频资源失败: ${err.message}`));
+    refreshPresence().catch(() => {});
   };
 
   ws.onerror = () => {
@@ -205,9 +475,15 @@ function bindWsEvents() {
   };
 
   ws.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      handleSignalText(event.data);
+      return;
+    }
+
     if (!(event.data instanceof ArrayBuffer)) {
       return;
     }
+
     if (usingWorklet) {
       playbackNode.port.postMessage(event.data, [event.data]);
     } else {
@@ -265,6 +541,7 @@ async function connect() {
     return;
   }
 
+  resetPingStats();
   setStatus("初始化音频...");
   await ensureAudio();
   ws = new WebSocket(buildWsUrl());
@@ -285,6 +562,7 @@ connectBtn.addEventListener("click", async () => {
     log(`连接失败: ${err.message}`);
     setStatus("连接失败");
     setConnectedUi(false);
+    stopPingLoop();
     await teardownAudio().catch(() => {});
   }
 });
@@ -300,9 +578,33 @@ muteBtn.addEventListener("click", () => {
 });
 
 volumeInput.addEventListener("change", () => {
-  const v = Math.max(0, Math.min(1, Number(volumeInput.value) || 1));
+  const v = currentVolumePercent();
   volumeInput.value = String(v);
   if (playbackGain) {
-    playbackGain.gain.value = v;
+    playbackGain.gain.value = v / 100;
   }
 });
+
+roomInput.addEventListener("change", () => {
+  roomInput.value = currentRoom();
+  refreshPresence().catch(() => {});
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    log("房间已修改，需断开后重连才会切换会话房间");
+  }
+});
+
+nameInput.addEventListener("change", () => {
+  nameInput.value = currentName();
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    log("昵称已修改，需断开后重连才会生效");
+  }
+});
+
+serverUrlInput.addEventListener("change", () => {
+  refreshPresence().catch(() => {});
+});
+
+renderRooms([]);
+renderUsers([]);
+resetPingStats();
+startPresenceLoop();

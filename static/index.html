@@ -12,6 +12,8 @@
       --text: #d7e5e0;
       --muted: #8aa39a;
       --danger: #f26f6f;
+      --line: #244951;
+      --subpanel: #0a161a;
     }
 
     * { box-sizing: border-box; }
@@ -27,7 +29,7 @@
     }
 
     .card {
-      width: min(680px, 100%);
+      width: min(1000px, 100%);
       background: color-mix(in oklab, var(--panel) 90%, #000);
       border: 1px solid #234149;
       border-radius: 16px;
@@ -40,10 +42,29 @@
       font-size: 24px;
     }
 
+    h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: #cfe4dd;
+      font-weight: 600;
+    }
+
     .desc {
       margin: 0 0 16px;
       color: var(--muted);
       font-size: 14px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .main,
+    .sidebar {
+      min-width: 0;
     }
 
     .grid {
@@ -64,7 +85,7 @@
       width: 100%;
       border-radius: 10px;
       border: 1px solid #2b4f57;
-      background: #0a161a;
+      background: #081114;
       color: var(--text);
       padding: 10px 12px;
       outline: none;
@@ -111,11 +132,11 @@
     #log {
       margin: 0;
       border-radius: 10px;
-      border: 1px solid #244951;
+      border: 1px solid var(--line);
       background: #081114;
       padding: 12px;
-      min-height: 140px;
-      max-height: 260px;
+      min-height: 190px;
+      max-height: 280px;
       overflow: auto;
       font-size: 12px;
       line-height: 1.45;
@@ -123,8 +144,77 @@
       color: #b6cbc4;
     }
 
+    .sidebar {
+      display: grid;
+      gap: 10px;
+    }
+
+    .side-block {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--subpanel);
+      padding: 12px;
+    }
+
+    .list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 6px;
+      max-height: 140px;
+      overflow: auto;
+    }
+
+    .list li {
+      border: 1px solid #264951;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 12px;
+      color: #c3d7d0;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .list li.empty {
+      justify-content: flex-start;
+      color: var(--muted);
+      border-style: dashed;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .metric {
+      border: 1px solid #264951;
+      border-radius: 8px;
+      padding: 8px;
+      background: #081114;
+    }
+
+    .metric .k {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    .metric .v {
+      font-size: 14px;
+      color: #d8eee7;
+      font-weight: 600;
+    }
+
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+
     @media (max-width: 640px) {
       .grid { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -133,33 +223,71 @@
     <h1>语音 IM（服务端统一降噪）</h1>
     <p class="desc">所有音频帧先发到 Rust 服务端，使用 nnnoiseless 降噪后再转发给同房间其他成员。</p>
 
-    <div class="grid">
-      <div>
-        <label for="serverUrl">WebSocket 地址</label>
-        <input id="serverUrl" />
-      </div>
-      <div>
-        <label for="room">房间</label>
-        <input id="room" value="main" />
-      </div>
-      <div>
-        <label for="name">昵称</label>
-        <input id="name" value="guest" />
-      </div>
-      <div>
-        <label for="volume">播放音量（0-1）</label>
-        <input id="volume" type="number" min="0" max="1" step="0.1" value="1" />
-      </div>
-    </div>
+    <div class="layout">
+      <div class="main">
+        <div class="grid">
+          <div>
+            <label for="serverUrl">WebSocket 地址</label>
+            <input id="serverUrl" />
+          </div>
+          <div>
+            <label for="room">房间</label>
+            <input id="room" value="main" />
+          </div>
+          <div>
+            <label for="name">昵称</label>
+            <input id="name" value="guest" />
+          </div>
+          <div>
+            <label for="volume">播放音量（0-100）</label>
+            <input id="volume" type="number" min="0" max="100" step="1" value="100" />
+          </div>
+        </div>
 
-    <div class="actions">
-      <button id="connectBtn">连接并开始语音</button>
-      <button id="disconnectBtn" class="danger" disabled>断开</button>
-      <button id="muteBtn" class="secondary" disabled>静音上行</button>
-    </div>
+        <div class="actions">
+          <button id="connectBtn">连接并开始语音</button>
+          <button id="disconnectBtn" class="danger" disabled>断开</button>
+          <button id="muteBtn" class="secondary" disabled>静音上行</button>
+        </div>
 
-    <div class="status" id="status">状态：未连接</div>
-    <pre id="log"></pre>
+        <div class="status" id="status">状态：未连接</div>
+        <pre id="log"></pre>
+      </div>
+
+      <aside class="sidebar">
+        <section class="side-block">
+          <h2>在线房间</h2>
+          <ul id="roomsList" class="list"></ul>
+        </section>
+
+        <section class="side-block">
+          <h2>当前房间在线成员</h2>
+          <ul id="usersList" class="list"></ul>
+        </section>
+
+        <section class="side-block">
+          <h2>到服务器链路质量</h2>
+          <div class="metrics">
+            <div class="metric">
+              <div class="k">Ping</div>
+              <div class="v" id="pingValue">-</div>
+            </div>
+            <div class="metric">
+              <div class="k">丢包率</div>
+              <div class="v" id="lossValue">0.0%</div>
+            </div>
+            <div class="metric">
+              <div class="k">探测包发送</div>
+              <div class="v" id="sentValue">0</div>
+            </div>
+            <div class="metric">
+              <div class="k">探测包收到</div>
+              <div class="v" id="recvValue">0</div>
+            </div>
+          </div>
+        </section>
+      </aside>
+    </div>
   </section>
 
   <script type="module" src="/app.js"></script>

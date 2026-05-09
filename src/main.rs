@@ -3,15 +3,15 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path, Query, State,
     },
     response::IntoResponse,
     routing::get,
-    Router,
+    Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use nnnoiseless::DenoiseState;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info};
@@ -50,6 +50,42 @@ struct WsParams {
     name: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ServerConfig {
+    #[serde(default, rename = "listenAddresses")]
+    listen_addresses: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RoomsResponse {
+    rooms: Vec<RoomSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct RoomSummary {
+    name: String,
+    online: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RoomUsersResponse {
+    room: String,
+    users: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientWsEvent {
+    Ping { seq: u64, ts: u64 },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ServerWsEvent {
+    Pong { seq: u64, ts: u64 },
+    RoomUsers { room: String, users: Vec<String> },
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -63,21 +99,141 @@ async fn main() {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/rooms", get(rooms_handler))
+        .route("/api/rooms/{room}/users", get(room_users_handler))
         .nest_service("/", ServeDir::new("static").append_index_html_on_directories(true))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind listener");
+    let listen_addrs = load_listen_addrs().unwrap_or_else(|message| {
+        eprintln!("failed to load listen addresses: {message}");
+        eprintln!("configure listen addresses in ./config.json with field listenAddresses");
+        std::process::exit(2);
+    });
 
-    info!(
-        "server started at http://127.0.0.1:3000, expected audio format: {} Hz mono, {} samples/frame",
-        SAMPLE_RATE, FRAME_SIZE
-    );
+    let mut listeners = Vec::with_capacity(listen_addrs.len());
+    for addr in listen_addrs {
+        let listener = bind_listener(addr).unwrap_or_else(|err| {
+            eprintln!("failed to bind listener {addr}: {err}");
+            std::process::exit(1);
+        });
+        info!(
+            "server started at http://{}, expected audio format: {} Hz mono, {} samples/frame",
+            addr, SAMPLE_RATE, FRAME_SIZE
+        );
+        listeners.push((addr, listener));
+    }
 
-    axum::serve(listener, app).await.expect("server crashed");
+    let mut servers = tokio::task::JoinSet::new();
+    for (addr, listener) in listeners {
+        let app = app.clone();
+        servers.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .map_err(|err| format!("server at http://{addr} crashed: {err}"))
+        });
+    }
+
+    if let Some(result) = servers.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+            Err(err) => {
+                eprintln!("server task join error: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket =
+        socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+
+    if let SocketAddr::V6(v6_addr) = addr {
+        if v6_addr.ip().is_unspecified() {
+            socket.set_only_v6(false)?;
+        }
+    }
+
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+fn load_listen_addrs() -> Result<Vec<SocketAddr>, String> {
+    const CONFIG_PATH: &str = "config.json";
+    const DEFAULT_LISTEN_ADDR: &str = "[::]:3000";
+
+    let config = load_config(CONFIG_PATH)?;
+    let mut addrs = Vec::new();
+
+    if config.listen_addresses.is_empty() {
+        push_listen_addr(&mut addrs, DEFAULT_LISTEN_ADDR)?;
+        return Ok(addrs);
+    }
+
+    for value in config.listen_addresses {
+        push_listen_addr(&mut addrs, &value)?;
+    }
+
+    Ok(addrs)
+}
+
+fn load_config(path: &str) -> Result<ServerConfig, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ServerConfig::default());
+        }
+        Err(err) => return Err(format!("failed to read {path}: {err}")),
+    };
+
+    serde_json::from_str::<ServerConfig>(&raw)
+        .map_err(|err| format!("failed to parse {path} as JSON: {err}"))
+}
+
+fn push_listen_addr(addrs: &mut Vec<SocketAddr>, value: &str) -> Result<(), String> {
+    let addr = parse_socket_addr(value)?;
+    if !addrs.contains(&addr) {
+        addrs.push(addr);
+    }
+    Ok(())
+}
+
+fn parse_socket_addr(value: &str) -> Result<SocketAddr, String> {
+    value.parse::<SocketAddr>().map_err(|_| {
+        format!(
+            "invalid listen address: {value} (expected ip:port, e.g. [::]:3000 or 0.0.0.0:3000)"
+        )
+    })
+}
+
+async fn rooms_handler(State(state): State<AppState>) -> Json<RoomsResponse> {
+    Json(RoomsResponse {
+        rooms: state.rooms_snapshot().await,
+    })
+}
+
+async fn room_users_handler(
+    State(state): State<AppState>,
+    Path(room): Path<String>,
+) -> Json<RoomUsersResponse> {
+    let room = sanitize_room(&room);
+    Json(RoomUsersResponse {
+        users: state.room_users_snapshot(&room).await,
+        room,
+    })
 }
 
 async fn ws_handler(
@@ -104,11 +260,17 @@ async fn handle_socket(state: AppState, socket: WebSocket, room: String, name: S
     });
 
     state
-        .add_client(&room, client_id, ClientConnection {
-            display_name: name.clone(),
-            tx: out_tx.clone(),
-        })
+        .add_client(
+            &room,
+            client_id,
+            ClientConnection {
+                display_name: name.clone(),
+                tx: out_tx.clone(),
+            },
+        )
         .await;
+
+    state.broadcast_room_users(&room).await;
 
     info!("client connected: room={room}, name={name}, id={client_id}");
     let mut denoise_state = DenoiseState::new();
@@ -135,15 +297,25 @@ async fn handle_socket(state: AppState, socket: WebSocket, room: String, name: S
                 }
                 state.broadcast_audio(&room, client_id, cleaned).await;
             }
+            Message::Text(text) => {
+                if let Ok(event) = serde_json::from_str::<ClientWsEvent>(text.as_ref()) {
+                    match event {
+                        ClientWsEvent::Ping { seq, ts } => {
+                            send_ws_event(&out_tx, &ServerWsEvent::Pong { seq, ts });
+                        }
+                    }
+                }
+            }
             Message::Ping(payload) => {
                 let _ = out_tx.send(Message::Pong(payload));
             }
             Message::Close(_) => break,
-            Message::Text(_) | Message::Pong(_) => {}
+            Message::Pong(_) => {}
         }
     }
 
     state.remove_client(&room, client_id).await;
+    state.broadcast_room_users(&room).await;
     write_task.abort();
     info!("client disconnected: room={room}, id={client_id}");
 }
@@ -187,6 +359,79 @@ impl AppState {
             if tx.send(Message::Binary(payload.clone().into())).is_err() {
                 error!("failed to push audio frame to client {name} in room {room}");
             }
+        }
+    }
+
+    async fn rooms_snapshot(&self) -> Vec<RoomSummary> {
+        let rooms = self.rooms.read().await;
+        let mut out = rooms
+            .iter()
+            .map(|(name, room)| RoomSummary {
+                name: name.clone(),
+                online: room.clients.len(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    async fn room_users_snapshot(&self, room: &str) -> Vec<String> {
+        let rooms = self.rooms.read().await;
+        let mut users = rooms
+            .get(room)
+            .map(|room_state| {
+                room_state
+                    .clients
+                    .values()
+                    .map(|client| client.display_name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        users.sort();
+        users
+    }
+
+    async fn broadcast_room_users(&self, room: &str) {
+        let (users, recipients) = {
+            let rooms = self.rooms.read().await;
+            let Some(room_state) = rooms.get(room) else {
+                return;
+            };
+
+            let mut users = room_state
+                .clients
+                .values()
+                .map(|client| client.display_name.clone())
+                .collect::<Vec<_>>();
+            users.sort();
+
+            let recipients = room_state
+                .clients
+                .values()
+                .map(|client| client.tx.clone())
+                .collect::<Vec<_>>();
+
+            (users, recipients)
+        };
+
+        let event = ServerWsEvent::RoomUsers {
+            room: room.to_string(),
+            users,
+        };
+
+        for tx in recipients {
+            send_ws_event(&tx, &event);
+        }
+    }
+}
+
+fn send_ws_event(tx: &mpsc::UnboundedSender<Message>, event: &ServerWsEvent) {
+    match serde_json::to_string(event) {
+        Ok(payload) => {
+            let _ = tx.send(Message::Text(payload.into()));
+        }
+        Err(err) => {
+            error!("failed to serialize ws event: {err}");
         }
     }
 }
