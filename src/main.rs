@@ -661,8 +661,9 @@ fn sanitize_name(raw: &str) -> String {
 
 fn sanitize_token(raw: &str, default: &str) -> String {
     let cleaned: String = raw
+        .trim()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\'))
         .take(32)
         .collect();
 

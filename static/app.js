@@ -130,11 +130,26 @@ function setConnectedUi(connected) {
   muteBtn.disabled = !connected;
 }
 
+function safeParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 function sanitizeToken(raw, fallback) {
-  const cleaned = (raw ?? "")
-    .toString()
-    .replace(/[^a-zA-Z0-9_-]/g, "")
-    .slice(0, 32);
+  const normalized = (raw ?? "").toString().normalize("NFC").trim();
+  const cleaned = Array.from(normalized)
+    .filter((ch) => {
+      const cp = ch.codePointAt(0) ?? 0;
+      if (cp <= 0x1f || cp === 0x7f) {
+        return false;
+      }
+      return ch !== "/" && ch !== "\\";
+    })
+    .slice(0, 32)
+    .join("");
   return cleaned || fallback;
 }
 
@@ -268,6 +283,51 @@ async function applyAudioProcessingSettingsRealtime() {
   if (failed > 0) {
     log("部分浏览器轨道不支持实时切换 AEC/NS/AGC，必要时请断开重连");
   }
+}
+
+function handleRtcDataChannelMessage(peerId, entry, raw) {
+  if (typeof raw !== "string") {
+    return;
+  }
+  const data = safeParseJson(raw);
+  if (!data || typeof data.type !== "string") {
+    return;
+  }
+
+  if (data.type === "ping" && Number.isInteger(data.seq) && Number.isFinite(data.ts)) {
+    if (entry.dc && entry.dc.readyState === "open") {
+      entry.dc.send(JSON.stringify({ type: "pong", seq: data.seq, ts: data.ts }));
+    }
+    return;
+  }
+
+  if (data.type === "pong" && Number.isInteger(data.seq)) {
+    onPongMessage(data.seq);
+  }
+}
+
+function attachRtcDataChannel(peerId, entry, dc) {
+  entry.dc = dc;
+  dc.onmessage = (event) => {
+    handleRtcDataChannelMessage(peerId, entry, event.data);
+  };
+  dc.onopen = () => {
+    log(`WebRTC 数据通道已建立: ${peerId.slice(0, 8)}`);
+  };
+  dc.onclose = () => {
+    if (entry.dc === dc) {
+      entry.dc = null;
+    }
+  };
+  dc.onerror = () => {};
+}
+
+function ensurePeerDataChannel(peerId, entry) {
+  if (entry.dc) {
+    return;
+  }
+  const dc = entry.pc.createDataChannel("ping", { ordered: true });
+  attachRtcDataChannel(peerId, entry, dc);
 }
 
 function updateFmtpParam(line, key, value) {
@@ -435,6 +495,7 @@ function getOrCreatePeerEntry(peerId) {
     pc,
     offerSent: false,
     pendingCandidates: [],
+    dc: null,
   };
   rtcPeers.set(peerId, entry);
 
@@ -468,6 +529,13 @@ function getOrCreatePeerEntry(peerId) {
       closeRtcPeer(peerId);
     }
   };
+  pc.ondatachannel = (event) => {
+    const dc = event.channel;
+    if (!dc) {
+      return;
+    }
+    attachRtcDataChannel(peerId, entry, dc);
+  };
 
   return entry;
 }
@@ -475,9 +543,18 @@ function getOrCreatePeerEntry(peerId) {
 function closeRtcPeer(peerId) {
   const entry = rtcPeers.get(peerId);
   if (entry) {
+    if (entry.dc) {
+      entry.dc.onmessage = null;
+      entry.dc.onopen = null;
+      entry.dc.onclose = null;
+      entry.dc.onerror = null;
+      entry.dc.close();
+      entry.dc = null;
+    }
     entry.pc.onicecandidate = null;
     entry.pc.ontrack = null;
     entry.pc.onconnectionstatechange = null;
+    entry.pc.ondatachannel = null;
     entry.pc.close();
     rtcPeers.delete(peerId);
   }
@@ -494,6 +571,7 @@ async function ensureOfferToPeer(peerId) {
     return;
   }
   entry.offerSent = true;
+  ensurePeerDataChannel(peerId, entry);
 
   const offer = await entry.pc.createOffer();
   await setLocalDescriptionWithOpusPrefs(entry.pc, offer);
@@ -1101,13 +1179,7 @@ function sweepPingTimeouts() {
   }
 }
 
-function sendPingProbe() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    return;
-  }
-
-  sweepPingTimeouts();
-
+function sendWsPingProbe() {
   const seq = ++pingSeq;
   const now = Date.now();
   pingSent += 1;
@@ -1116,6 +1188,43 @@ function sendPingProbe() {
   trimPingHistory();
 
   ws.send(JSON.stringify({ type: "ping", seq, ts: now }));
+}
+
+function sendWebRtcPingProbe() {
+  const channels = [];
+  for (const entry of rtcPeers.values()) {
+    if (entry.dc && entry.dc.readyState === "open") {
+      channels.push(entry.dc);
+    }
+  }
+
+  if (channels.length === 0) {
+    updatePingStatsUi();
+    return;
+  }
+
+  const now = Date.now();
+  for (const dc of channels) {
+    const seq = ++pingSeq;
+    pingSent += 1;
+    pingPending.set(seq, now);
+    pingHistory.push({ seq, status: "pending" });
+    dc.send(JSON.stringify({ type: "ping", seq, ts: now }));
+  }
+  trimPingHistory();
+}
+
+function sendPingProbe() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  sweepPingTimeouts();
+  if (transportMode === TRANSPORT_WEBRTC) {
+    sendWebRtcPingProbe();
+  } else {
+    sendWsPingProbe();
+  }
   updatePingStatsUi();
 }
 
@@ -1416,6 +1525,7 @@ function bindWsEvents() {
       log(
         `WebSocket 已连接，音频通道: WebRTC (Opus 目标 ${OPUS_BITRATE / 1000} kbps, 软下限 ${OPUS_MIN_SOFT_BITRATE / 1000} kbps, ${currentChannelLabel()}, ${currentAudioProcessingLabel()})`
       );
+      log("Ping 探测已切换为 WebRTC 数据通道真实链路 RTT");
     } else {
       log(`WebSocket 已连接，当前编码: ${codecMode.toUpperCase()}`);
     }
